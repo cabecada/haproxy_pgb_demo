@@ -1,0 +1,342 @@
+```
+tests:
+postgres@demo:~/temp$ #stop pg on 5432
+postgres@demo:~/temp$ pg_ctl -D db1 -l db1.log stop
+waiting for server to shut down.... done
+server stopped
+
+#since pgbouncer is running, we cannot failover
+postgres@demo:~/temp$ timeout 5 psql -p 5001 -U postgres -d postgres -h 127.0.0.1 -c 'select pg_is_in_recovery();'
+postgres@demo:~/temp$ echo $?
+124
+postgres@demo:~/temp$ timeout 5 psql -p 8001 -U postgres -d postgres -h 127.0.0.1 -c 'select pg_is_in_recovery();'
+psql: error: connection to server at "127.0.0.1", port 8001 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+
+#so haproxy will not disable frontend ReadWrite, even if health check for postgres and pgbouncer fail
+postgres@demo:~/temp$ ps aux | grep pgbouncer
+postgres    7747  0.0  0.3  18128  3772 ?        Sl   11:35   0:01 pgbouncer -u postgres -v -d db2.ini
+postgres   46590  0.0  0.3  18132  3840 ?        Sl   12:25   0:00 pgbouncer -u postgres -v -d db1.ini
+postgres   50011  0.0  0.0   7696   624 pts/0    S+   12:28   0:00 grep pgbouncer
+postgres@demo:~/temp$ kill 7747
+postgres@demo:~/temp$ timeout 5 psql -p 5001 -U postgres -d postgres -h 127.0.0.1 -c 'select pg_is_in_recovery();'
+FATAL:  server login has been failing, try again later (server_login_retry)
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+postgres@demo:~/temp$ timeout 5 psql -p 8001 -U postgres -d postgres -h 127.0.0.1 -c 'select pg_is_in_recovery();'
+psql: error: connection to server at "127.0.0.1", port 8001 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+
+### on the haproxy status for frontend is OPEN, hence psql will not failover to other node
+psql "postgresql://127.0.0.1:8001,127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+psql: error: connection to server at "127.0.0.1", port 8001 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+
+
+we need to mark the frontend down explictly via runtime api
+then via socat
+sudo socat stdio tcp4-connect:127.0.0.1:9999
+disable frontend ReadWrite
+
+#on the dashboard for haproxy it changes from OPEN to STOP
+
+now haproxy simply considers the frontend down and routes to 8002
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:8001,127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ t
+(1 row)
+
+postgres@demo:~/temp$ timeout 5 psql "postgresql://127.0.0.1:5001,127.0.0.1:5002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+FATAL:  server login has been failing, try again later (server_login_retry)
+server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
+connection to server was lost
+postgres@demo:~/temp$ #pgbouncer still failing as is active but backend is not
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:8001,127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ t
+(1 row)
+
+#even if pg recovers and pgbouncer recovers and both healthy, we need to enable haproxy frontend else
+postgres@demo:~/temp$ #pgbouncer still failing as is active but backend is not
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:8001,127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ t
+(1 row)
+
+postgres@demo:~/temp$ pg_ctl -D db1 -l db1.log start
+waiting for server to start.... done
+server started
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:8001,127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ t
+(1 row)
+
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:5001,127.0.0.1:5002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ f
+(1 row)
+
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:5432,127.0.0.1:5433/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ f
+(1 row)
+
+
+
+##all up db,haproxy,pgb
+
+root@demo:~# sudo socat stdio tcp4-connect:127.0.0.1:9999
+enable frontend ReadWrite
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:8001,127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ f
+(1 row)
+
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:5001,127.0.0.1:5002/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ f
+(1 row)
+
+postgres@demo:~/temp$ psql "postgresql://127.0.0.1:5432,127.0.0.1:5433/postgres?target_session_attrs=any" -c 'select pg_is_in_recovery();'
+ pg_is_in_recovery
+-------------------
+ f
+(1 row)
+
+
+
+
+
+```
+
+For psql libpq to failover another connection host, it needs to get a connection refused response when trying to connect to a server, if not, it will not failover. 
+see below 
+
+# pgbouncer hangs/waits to recover and retries if no backend db, but no connection refused 
+timeout 4 strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:5002/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(38318), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "N", 16384, 0, NULL, NULL)  = 1
+sendto(3, "\0\0\0T\0\3\0\0user\0postgres\0database\0postgres\0application_name\0psql\0client_encoding\0UTF8\0\0", 84, MSG_NOSIGNAL, NULL, 0) = 84
+strace: Process 7647 detached
+
+#if pgbouncer is killed, then we get conn refused, to multi connection string with 5002, and 5003 pgbouncer failover would work
+
+strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:5002/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0
+psql: error: connection to server at "127.0.0.1", port 5002 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
+
+postgres@demo:~/temp$ ps aux | grep pgbou
+postgres    4220  0.0  0.3  18132  3832 ?        Sl   10:17   0:00 pgbouncer -u postgres -d pgdb1.ini
+postgres    7511  0.0  0.3  18132  3892 ?        Sl   10:29   0:00 pgbouncer -u postgres -d pgdb2.ini
+postgres   10300  0.0  0.3  17928  3208 ?        Sl   10:32   0:00 pgbouncer -u postgres -d pgdb3.ini
+postgres   10374  0.0  0.0   7696   628 pts/0    S+   10:32   0:00 grep pgbou
+postgres@demo:~/temp$ kill 7511
+postgres@demo:~/temp$ ps aux | grep pgbou
+postgres    4220  0.0  0.3  18132  3832 ?        Sl   10:17   0:00 pgbouncer -u postgres -d pgdb1.ini
+postgres   10300  0.0  0.3  17928  3208 ?        Sl   10:32   0:00 pgbouncer -u postgres -d pgdb3.ini
+postgres   10500  0.0  0.0   7696   604 pts/0    S+   10:32   0:00 grep pgbou
+postgres@demo:~/temp$ strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:5002,127.0.0.1:5003/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5003), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(58994), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "N", 16384, 0, NULL, NULL)  = 1
+sendto(3, "\0\0\0T\0\3\0\0user\0postgres\0database\0postgres\0application_name\0psql\0client_encoding\0UTF8\0\0", 84, MSG_NOSIGNAL, NULL, 0) = 84
+recvfrom(3, "R\0\0\0\10\0\0\0\0S\0\0\0&default_transaction_read_only\0off\0S\0\0\0\26in_hot_standby\0on\0S\0\0\0\31integer_datetimes\0on\0S\0\0\0\33IntervalStyle\0postgres\0S\0\0\0\24is_superuser\0on\0S\0\0\0\31server_encoding\0UTF8\0S\0\0\0004server_version\00014.3 (Ubuntu 14.3-1.pgdg20.04+1)\0S\0\0\0#session_authorization\0postgres\0S\0\0\0\31client_encoding\0UTF8\0S\0\0\0\27DateStyle\0ISO, MDY\0S\0\0\0\32TimeZone\0Asia/Kolkata\0S\0\0\0#standard_conforming_strings\0on\0S\0\0\0\32application_name\0psql\0K\0\0\0\f\261\3706\364\3260]-Z\0\0\0\5I", 16384, 0, NULL, NULL) = 420
+sendto(3, "Q\0\0\0\37select inet_server_port();\0", 32, MSG_NOSIGNAL, NULL, 0) = 32
+recvfrom(3, "T\0\0\0)\0\1inet_server_port\0\0\0\0\0\0\0\0\0\0\27\0\4\377\377\377\377\0\0D\0\0\0\16\0\1\0\0\0\0045434C\0\0\0\rSELECT 1\0Z\0\0\0\5I", 16384, 0, NULL, NULL) = 77
+ inet_server_port 
+------------------
+             5434
+(1 row)
+
+recvfrom(3, 0xaaaac314d870, 16384, 0, NULL, NULL) = -1 EAGAIN (Resource temporarily unavailable)
+sendto(3, "X\0\0\0\4", 5, MSG_NOSIGNAL, NULL, 0) = 5
++++ exited with 0 +++
+
+
+### similary with postgres directly, if db1 is down, it will failover to db2 iff econnrefused from db1
+strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:5433,127.0.0.1:5434/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5433), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5434), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(45696), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "N", 16384, 0, NULL, NULL)  = 1
+sendto(3, "\0\0\0T\0\3\0\0user\0postgres\0database\0postgres\0application_name\0psql\0client_encoding\0UTF8\0\0", 84, MSG_NOSIGNAL, NULL, 0) = 84
+recvfrom(3, "R\0\0\0\10\0\0\0\0S\0\0\0\32application_name\0psql\0S\0\0\0\31client_encoding\0UTF8\0S\0\0\0\27DateStyle\0ISO, MDY\0S\0\0\0&default_transaction_read_only\0off\0S\0\0\0\26in_hot_standby\0on\0S\0\0\0\31integer_datetimes\0on\0S\0\0\0\33IntervalStyle\0postgres\0S\0\0\0\24is_superuser\0on\0S\0\0\0\31server_encoding\0UTF8\0S\0\0\0004server_version\00014.3 (Ubuntu 14.3-1.pgdg20.04+1)\0S\0\0\0#session_authorization\0postgres\0S\0\0\0#standard_conforming_strings\0on\0S\0\0\0\32TimeZone\0Asia/Kolkata\0K\0\0\0\f\0\0\31Io\237x\312Z\0\0\0\5I", 16384, 0, NULL, NULL) = 420
+sendto(3, "Q\0\0\0\37select inet_server_port();\0", 32, MSG_NOSIGNAL, NULL, 0) = 32
+recvfrom(3, "T\0\0\0)\0\1inet_server_port\0\0\0\0\0\0\0\0\0\0\27\0\4\377\377\377\377\0\0D\0\0\0\16\0\1\0\0\0\0045434C\0\0\0\rSELECT 1\0Z\0\0\0\5I", 16384, 0, NULL, NULL) = 77
+ inet_server_port 
+------------------
+             5434
+(1 row)
+
+recvfrom(3, 0xaaaadabf2870, 16384, 0, NULL, NULL) = -1 EAGAIN (Resource temporarily unavailable)
+sendto(3, "X\0\0\0\4", 5, MSG_NOSIGNAL, NULL, 0) = 5
++++ exited with 0 +++
+
+
+
+#### but this will not work with haproxy since it does not give econnrefused untill backend disabled
+ strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(8002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(47414), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "", 16384, 0, NULL, NULL)   = 0
+recvfrom(3, "", 16384, 0, NULL, NULL)   = 0
+psql: error: connection to server at "127.0.0.1", port 8002 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
++++ exited with 2 +++
+
+
+
+
+but if we disable frontend as above, we get conn refused.
+
+postgres@demo:~/temp$ strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(8002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(47414), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "", 16384, 0, NULL, NULL)   = 0
+recvfrom(3, "", 16384, 0, NULL, NULL)   = 0
+psql: error: connection to server at "127.0.0.1", port 8002 failed: server closed the connection unexpectedly
+	This probably means the server terminated abnormally
+	before or while processing the request.
++++ exited with 2 +++
+postgres@demo:~/temp$ sudo socat stdio tcp4-connect:127.0.0.1:9999
+disable frontend ReadOnly 
+
+postgres@demo:~/temp$ strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:8002/postgres?target_session_attrs=any" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(8002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0
+psql: error: connection to server at "127.0.0.1", port 8002 failed: Connection refused
+	Is the server running on that host and accepting TCP/IP connections?
++++ exited with 2 +++
+
+```
+
+
+
+```
+use connect_timeout for hanging pgbouncer to force failover,
+
+strace -f -e trace=network -s 10000  -- psql "postgresql://127.0.0.1:5002,127.0.0.1:5003/postgres?target_session_attrs=any&connect_timeout=5" -c 'select inet_server_port();'
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC|SOCK_NONBLOCK, 0) = 3
+connect(3, {sa_family=AF_UNIX, sun_path="/var/run/nscd/socket"}, 110) = -1 ENOENT (No such file or directory)
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5002), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(41788), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "N", 16384, 0, NULL, NULL)  = 1
+sendto(3, "\0\0\0T\0\3\0\0user\0postgres\0database\0postgres\0application_name\0psql\0client_encoding\0UTF8\0\0", 84, MSG_NOSIGNAL, NULL, 0) = 84
+socket(AF_INET, SOCK_STREAM, IPPROTO_IP) = 3
+setsockopt(3, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+setsockopt(3, SOL_SOCKET, SO_KEEPALIVE, [1], 4) = 0
+connect(3, {sa_family=AF_INET, sin_port=htons(5003), sin_addr=inet_addr("127.0.0.1")}, 16) = -1 EINPROGRESS (Operation now in progress)
+getsockopt(3, SOL_SOCKET, SO_ERROR, [0], [4]) = 0
+getsockname(3, {sa_family=AF_INET, sin_port=htons(32884), sin_addr=inet_addr("127.0.0.1")}, [128->16]) = 0
+sendto(3, "\0\0\0\10\4\322\26/", 8, MSG_NOSIGNAL, NULL, 0) = 8
+recvfrom(3, "N", 16384, 0, NULL, NULL)  = 1
+sendto(3, "\0\0\0T\0\3\0\0user\0postgres\0database\0postgres\0application_name\0psql\0client_encoding\0UTF8\0\0", 84, MSG_NOSIGNAL, NULL, 0) = 84
+recvfrom(3, "R\0\0\0\10\0\0\0\0S\0\0\0&default_transaction_read_only\0off\0S\0\0\0\26in_hot_standby\0on\0S\0\0\0\31integer_datetimes\0on\0S\0\0\0\33IntervalStyle\0postgres\0S\0\0\0\24is_superuser\0on\0S\0\0\0\31server_encoding\0UTF8\0S\0\0\0004server_version\00014.3 (Ubuntu 14.3-1.pgdg20.04+1)\0S\0\0\0#session_authorization\0postgres\0S\0\0\0\31client_encoding\0UTF8\0S\0\0\0\27DateStyle\0ISO, MDY\0S\0\0\0\32TimeZone\0Asia/Kolkata\0S\0\0\0#standard_conforming_strings\0on\0S\0\0\0\32application_name\0psql\0K\0\0\0\f\273G<ncU\250\30Z\0\0\0\5I", 16384, 0, NULL, NULL) = 420
+sendto(3, "Q\0\0\0\37select inet_server_port();\0", 32, MSG_NOSIGNAL, NULL, 0) = 32
+recvfrom(3, "T\0\0\0)\0\1inet_server_port\0\0\0\0\0\0\0\0\0\0\27\0\4\377\377\377\377\0\0D\0\0\0\16\0\1\0\0\0\0045434C\0\0\0\rSELECT 1\0Z\0\0\0\5I", 16384, 0, NULL, NULL) = 77
+ inet_server_port 
+------------------
+             5434
+(1 row)
+
+recvfrom(3, 0xaaab1e1c4870, 16384, 0, NULL, NULL) = -1 EAGAIN (Resource temporarily unavailable)
+sendto(3, "X\0\0\0\4", 5, MSG_NOSIGNAL, NULL, 0) = 5
++++ exited with 0 +++
+ ```
+
