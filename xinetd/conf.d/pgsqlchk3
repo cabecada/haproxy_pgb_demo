@@ -1,0 +1,14 @@
+service pgsqlch31  
+{  
+        flags           = REUSE  
+        socket_type     = stream  
+        port            = 23269  
+        wait            = no  
+        user            = nobody  
+        server          = /opt/pgsqlchk3  
+        log_on_failure  += USERID  
+        disable         = no  
+        only_from       = 0.0.0.0/0
+        per_source      = UNLIMITED  
+}
+
